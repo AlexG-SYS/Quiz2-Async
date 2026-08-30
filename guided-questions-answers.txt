@@ -1,0 +1,271 @@
+# Guided Questions
+
+## Section 1 — Architecture and HTTP
+
+Q01 — What problem occurs when report generation happens inside the original HTTP request?
+The handler's goroutine blocks for the full duration of `Reports.Generate` (plus any
+artificial delay). The client's connection stays open the whole time, a DB connection
+and a request-handling goroutine are tied up for that whole window, and slow reports
+risk running into `WriteTimeout`. Under concurrent load this doesn't scale —
+every slow report ties up resources for as long as it runs.
+
+Q02 — What specific requirement justifies moving report generation into a background worker?
+The requirement is: *acknowledge the request quickly, regardless of how long the report
+takes.* Moving `Generate()` out of the handler and into `processNextReportJob` decouples
+response latency from work duration entirely.
+
+Q03 — What does it mean to separate request lifetime from work lifetime? Where does each begin/end?
+- Request lifetime: starts when `POST /v1/reports` arrives, ends when `createReportHandler`
+  returns — right after `Jobs.Insert` commits and the 202 is written.
+- Work lifetime: starts when `ClaimNext` flips the row to `processing` (up to
+  `workerPollInterval` later), ends when `MarkCompleted`/`MarkFailed` commits. Can be
+  seconds or minutes later, on a totally different goroutine.
+
+Q04 — Why does the async architecture need a persistent job resource instead of just returning immediately?
+Without a durable row, there'd be nothing for the client to check later and nothing for
+the worker to claim — the result would exist only inside a single function call and be
+lost the instant that call returned. The job row is the handle that survives past the
+HTTP response and even past a worker restart.
+
+**Q05 — What does the client ask POST to do, and what does 202 promise?**
+The client asks the system to generate a report for a consumer. `202
+Accepted` promises only that the request was valid and has been recorded for processing —
+nothing about completion or success.
+
+Q06 — Why doesn't 202 mean the report finished or will succeed?
+Because the handler returns immediately after `Jobs.Insert`, before any worker has even
+looked at the row (`Status` is still `"queued"` at response time). Generation can still
+fail later — that's exactly what `MarkFailed` is for.
+
+Q07 — What must the initial response provide so the client can find the job later?
+`job_id` (the `PublicID`) and a `status_url` 
+
+Q08 — Why expose `PublicID` instead of the internal database ID?
+So the API contract isn't tied to internal storage details, and so the identifier scheme can change internally without breaking clients. `ID` is tagged `json:"-"` specifically to keep it out of every response.
+
+Q09 — How does `GET /v1/jobs/{id}` differ in purpose from POST?
+POST is a write — it creates a new job and has a side effect. GET is read-only and
+idempotent: calling it a hundred times never changes job state, it only reports whatever
+the worker last wrote.
+
+Q10 — How do queued / processing / completed / failed communicate different stages?
+- `queued`: row inserted, `started_at` still nil, no worker has claimed it.
+- `processing`: `ClaimNext` claimed it, `started_at` set.
+- `completed`: `MarkCompleted` ran, `result` populated, `completed_at` set.
+- `failed`: `MarkFailed` ran, `error_message` populated, `completed_at` set.
+
+
+## Section 2 — Jobs and PostgreSQL
+
+Q11 — What do the Job fields represent?
+`ConsumerID` — which consumer the report is for (FK). 
+`JobType` — discriminator selecting
+which worker logic handles it (`ClaimNext` filters on it). 
+`Status` — lifecycle stage.
+`Payload` — the input needed to run the job, stored as JSON precisely so future job types
+can reuse this same table with a different payload shape. 
+`Result` — the JSON output once done. 
+`ErrorMessage` — why it failed. `StartedAt`/`CompletedAt`
+`CreatedAt` — when queued.
+
+Q12 — Why are some fields pointers, and what does a missing timestamp/error mean?
+`ErrorMessage`, `StartedAt`, `CompletedAt` are nullable columns, so they're modeled as
+Go pointers rather than value types — a nil pointer round-trips
+correctly to/from SQL `NULL`. A nil `StartedAt` means still queued; nil `CompletedAt`
+means not yet terminal; nil `ErrorMessage` means no failure has been recorded.
+
+Q13 — What is the purpose of `json.Marshal(job.Payload)` before inserting a job?
+The `payload` column is JSONB; the query parameter needs to be bytes representing
+valid JSON, not a Go struct, so `Payload` must be serialized first.
+
+Q14 — Which values does the app supply, and which does the database generate/default?**
+App supplies: `ConsumerID`, `JobType`, `Payload`. Database supplies (via column defaults
+and `RETURNING`): `id`, `public_id`, `status` (defaults to `'queued'`), `created_at`.
+
+Q15 — How does `RETURNING` populate the Go job struct immediately after INSERT?**
+`RETURNING id, public_id, status, created_at` makes the INSERT behave like a SELECT that
+returns those generated column values in the same round trip;
+reads them straight into the struct that was passed in, so there's no need for a
+follow-up `SELECT`.
+
+Q16 — What does a foreign-key violation reveal about the jobs/consumers relationship?
+It shows `jobs.consumer_id` has a `FOREIGN KEY` constraint referencing `consumers(id)` —
+a job cannot exist without a real consumer to belong to. 
+
+Q17 — Why does `ClaimNext` begin a transaction before selecting a job?*
+So the `SELECT ... FOR UPDATE` and the subsequent `UPDATE ... SET status = 'processing'`
+happen atomically — no other transaction can observe or modify the row in between, and
+the row lock from `FOR UPDATE` is held for the whole transaction.
+
+Q18 — What is the effect of `WHERE status = 'queued'` and filtering by `job_type`?
+Narrows candidates to unclaimed jobs of exactly this worker's job type, so this worker
+never picks up an already-claimed row or a future, unrelated job type.
+
+Q19 — Why does `ORDER BY created_at` usually prioritize older jobs? What does `LIMIT 1` guarantee?
+Ascending order puts the oldest queued row first, giving approximate FIFO processing.
+`LIMIT 1` guarantees a single `ClaimNext` call claims at most one job.
+
+Q20 — What does `FOR UPDATE` do, and why does `SKIP LOCKED` matter with multiple workers?**
+`FOR UPDATE` takes a row lock on the selected row so no other transaction can lock it concurrently. `SKIP LOCKED` tells Postgres to skip any candidate row already locked by another transaction instead of blocking on it 
+
+Q21 — Why must selecting a queued job and updating it to processing happen in the same transaction?
+To prevent a race where two workers both see the row as `queued` and both try to claim
+it. atomicity guarantees that once one worker's transaction commits, the row is
+`processing` and can no longer match another worker.
+
+Q22 — What happens when no queued job exists, and why is `sql.ErrNoRows` treated differently from a real failure?
+`Scan` on zero rows returns `sql.ErrNoRows`; the expected, common case (nothing to do
+right now). The worker loop explicitly excludes it (and `context.Canceled`) from the
+`app.logger.Error(...)` call, so normal empty ticks don't spam the logs.
+
+
+## Section 3 — Worker and Concurrency
+
+Q23 — Where is the worker started, and why must it start once for the app rather than once per request?
+Started once in `main()`, right after `app` is built, before `app.serve()`. Once, because
+its lifetime is the whole process — a per-request worker would spawn redundant polling
+loops with no coherent way to tie their lifetime to shutdown.
+
+Q24 — What do `context.WithCancel`, `workerCtx`, `cancelWorker`, and `app.workerCancel` each represent?
+`context.WithCancel(parent)` returns a child context plus a function that closes that
+context's `Done()` channel when called. `workerCtx` is what's passed into the worker
+loop. `cancelWorker` is the function that triggers cancellation. `app.workerCancel`
+stores that same function on the `application` struct so `server.go`'s shutdown
+goroutine
+
+Q25 — Why does `startReportWorker` call `app.wg.Add(1)` before starting the goroutine?
+To avoid a race: if `Add` happened inside the new goroutine, the main goroutine's later
+`wg.Wait()` could run before that `Add` executes, and `Wait()` would return immediately
+(counter still 0) without ever waiting for the worker.
+
+Q26 — What does `go func() {...}()` do, and why is `defer app.wg.Done()` important?
+It launches the polling loop as a new, concurrently running goroutine. `defer wg.Done()`
+guarantees the counter is decremented whenever that goroutine exits, on any return path —
+without it, `wg.Wait()` in shutdown could block forever.
+
+Q27 — What does `time.NewTicker(app.config.workerPollInterval)` create?
+A ticker that sends the current time on its channel `C` repeatedly at a fixed interval,
+so the loop wakes up periodically instead of busy-polling.
+
+Q28 — What does the `select` choose between?
+`ctx.Done()` (told to stop — shutdown in progress) vs `ticker.C` (time to check for
+work). Whichever fires first is handled.
+
+Q29 — How does the polling interval affect the delay between job creation and job start?
+It bounds the worst case: a job created right after a tick just fired can wait up to one
+full `workerPollInterval` before the next tick triggers `ClaimNext` and notices it.
+
+Q30 — Why is `defer ticker.Stop()` appropriate when the worker exits?
+It releases the ticker's internal timer resource once the goroutine returns, so nothing
+is leaked if the loop exits.
+
+Q31 — Where is `reportDelay` applied, and why must it be in `processNextReportJob`, not the POST handler?
+Applied inside `processNextReportJob`, after `ClaimNext`, before `Generate`. It has to
+live there because the entire point of the architecture is that the POST handler already
+returned before this runs — putting the delay in the handler would make the request
+block again and defeat the design (and would corrupt the ack-time vs. completion-time
+measurement the lab is built around).
+
+Q32 — What do `time.NewTimer`, `timer.C`, and `ctx.Done()` accomplish during the artificial delay?
+`NewTimer` starts a one-shot timer that fires `timer.C` after `reportDelay`. The `select`
+races that against `ctx.Done()`: normally `timer.C` wins after the full delay, but if
+shutdown starts mid-wait, `ctx.Done()` becomes ready first.
+
+Q33 — How does cancellation let the worker stop waiting before the timer naturally expires?
+Because it's a `select`, whichever channel is ready first wins — `ctx.Done()` closing due
+to `workerCancel()` makes that case immediately ready, so the function returns `ctx.Err()`
+without waiting out the rest of the timer.
+
+Q34 — Why does increasing `reportDelay` affect completion time more strongly than acknowledgment time?
+`ack_time` only measures the POST handler's own duration —
+`Insert` plus writing the response — which never touches `reportDelay`. `complete_time`
+spans from before the POST to the job reaching a terminal state, which does include
+time spent inside the worker's artificial delay. So `reportDelay` moves `complete_time`
+almost directly, while `ack_time` stays roughly flat.
+
+
+## Section 4 — Reports, Failure, and Shutdown
+
+Q35 — Why does the report query start from `consumers`? What do the `LEFT JOIN`s contribute?
+Starting `FROM consumers` with `WHERE c.id = $1` guarantees a row for the target
+consumer is returned even if they have zero keys or zero jobs — an `INNER JOIN` would
+drop the consumer entirely in that case, since nothing would match. `LEFT JOIN` keeps the
+consumer row and fills unmatched key/job columns with `NULL`.
+
+Q36 — Why can joining `api_keys` and `jobs` multiply rows, and how does `COUNT(DISTINCT ...)` prevent inflated counts?
+Joining two independent one-to-many relationships off the same consumer produces a
+cross-product-style fan-out: a consumer with 3 keys and 5 jobs produces 15 joined rows,
+not 8, before aggregation. `COUNT(DISTINCT k.id)` / `COUNT(DISTINCT j.id)` counts unique
+key/job ids regardless of how many times each got repeated by the *other* join's
+fan-out, so the totals aren't inflated.
+
+Q37 — What does `FILTER (WHERE ...)` do, and how does it produce separate totals per status?
+It attaches a condition to one specific aggregate call, so that `COUNT` only counts rows
+satisfying that condition — while the query still computes several such conditional
+counts (one per output column) in a single pass over the same joined rows, instead of
+six separate queries.
+
+Q38 — Why `j.created_at >= $2 AND j.created_at < $3` instead of two inclusive bounds?
+It's a half-open interval `[from, to)`. A job created at exactly the `to` boundary
+belongs to only the *next* window, not this one — inclusive bounds on both ends would let
+a boundary-timestamp job get counted in two adjacent reporting periods.
+
+Q39 — What do `GROUP BY c.id, c.name` and `QueryRowContext(...).Scan(...)` each accomplish?
+`GROUP BY` collapses the fanned-out joined rows back into one summary row per consumer
+(required for the aggregate functions to make sense). `QueryRowContext(...).Scan(...)`
+executes expecting exactly one result row and reads each selected column, in order, into
+the corresponding `ConsumerActivityReport` field.
+
+Q40 — Why is the generated report marshaled into JSON before `MarkCompleted` stores it?
+`jobs.result` is a JSON/JSONB column, so the Go struct has to become JSON bytes/text
+before it can be passed as a query parameter and storing it as real JSON not a
+Go-specific encoding means it can be returned to the client as-is.
+
+Q41 — Which columns does `MarkCompleted` update? Which does `MarkFailed` update?
+`MarkCompleted`: `status = 'completed'`, `result = $2`, `completed_at = now()`.
+`MarkFailed`: `status = 'failed'`, `error_message = $2`, `completed_at = now()`. Both
+stamp `completed_at` since it marks reached a terminal state, regardless of outcome.
+
+Q42 — How can the original POST succeed while the background job later fails?
+Because POST only performs a lightweight `INSERT` and returns 202 — it never calls
+`Generate()`. Report generation happens later, on a different goroutine, and can fail
+independently (a DB error, or the consumer no longer existing) without touching the
+already-completed HTTP response.
+
+Q43 — How do logs, the stored `error_message`, and `GET /v1/jobs/{id}` help diagnose a failed job?
+`error_message` on the row is what the client sees directly through `GET /v1/jobs/{id}` 
+no server access needed to know why a specific job failed. Worker logs
+(`app.logger.Error`) separately capture failures in the worker loop's own control flow
+(if `MarkFailed` itself errors), useful for operators watching the process rather
+than a specific client tracking one job.
+
+Q44 — What happens when the application receives SIGINT (Ctrl+C)?**
+The goroutine blocked on `<-quit` in `serve()` wakes up, logs the signal, then runs the
+shutdown sequence: `srv.Shutdown(ctx)` → `app.workerCancel()` → `app.wg.Wait()`.
+
+Q45 — What does `srv.Shutdown(ctx)` do before the program waits for background tasks?
+Stops the HTTP server from accepting new connections and waits (up to the 30s `ctx`
+timeout) for already-in-flight request handlers to finish, rather than dropping active
+connections abruptly.
+
+Q46 — Why must `app.workerCancel()` execute before `app.wg.Wait()`?
+`wg.Wait()` only unblocks once the worker's `defer wg.Done()` runs, which only happens
+when the worker's loop exits via its `ctx.Done()` case. If `workerCancel()` were never
+called (or called after `Wait()`), the worker's context is never cancelled, the loop keeps
+ticking forever, and `wg.Wait()` blocks indefinitely
+
+Q47 — Why does deferring `cancelWorker` in `main` alone not prevent shutdown from hanging?
+`main`'s `defer cancelWorker()` only runs once `main()` itself returns — which requires
+`app.serve()` to return first. But `serve()`'s own shutdown goroutine calls
+`app.wg.Wait()` from inside `serve()`, before `main` ever gets a chance to run its
+deferred call. Relying only on `main`'s defer would deadlock: `serve()` would block
+forever in `wg.Wait()` waiting for a worker nothing ever told to stop. That's exactly
+why `server.go` calls `app.workerCancel()` itself, as an explicit step in its own
+shutdown sequence, instead of relying on `main`'s defer.
+
+Q48 — How do cancellation, `ctx.Done()`, `app.wg.Done()`, and `app.wg.Wait()` fit together?
+`SIGINT` → `srv.Shutdown` → `app.workerCancel()` called → `workerCtx.Done()` channel
+closes → worker's `select` sees that case ready → loop `return`s → deferred `wg.Done()`
+runs, dropping the counter to 0 → `app.wg.Wait()` (already blocked, waiting) unblocks →
+`shutdownError <- nil` → `serve()` returns `nil` → `main()` exits cleanly.
+

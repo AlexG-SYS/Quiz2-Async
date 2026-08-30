@@ -1,3 +1,8 @@
+
+VIDEO LINK: https://drive.google.com/file/d/1TNCN24jAVY5jYZSM2dC9xVZlR1dqSUCA/view
+
+
+
 # GateKeeper: asynchronous report API
 
 This complete starter repository accompanies the `202 Accepted + Job + Worker`

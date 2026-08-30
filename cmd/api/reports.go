@@ -6,8 +6,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/lewisdalwin/gatekeeper/internal/data"
-	"github.com/lewisdalwin/gatekeeper/internal/validator"
+	"github.com/AlexG-SYS/Quiz2-Async/internal/data"
+	"github.com/AlexG-SYS/Quiz2-Async/internal/validator"
 )
 
 // createReportHandler is the async entry point. Its entire job is to

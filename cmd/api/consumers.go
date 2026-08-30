@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/lewisdalwin/gatekeeper/internal/data"
-	"github.com/lewisdalwin/gatekeeper/internal/validator"
+	"github.com/AlexG-SYS/Quiz2-Async/internal/data"
+	"github.com/AlexG-SYS/Quiz2-Async/internal/validator"
 )
 
 // createConsumersHandler is synchronous
